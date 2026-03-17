@@ -37,8 +37,8 @@ import os
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
 GEMINI_MODEL:   str = "gemini-1.5-flash"
 GEMINI_URL:     str = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 )
 
 # Simple pre-shared API keys for demo auth

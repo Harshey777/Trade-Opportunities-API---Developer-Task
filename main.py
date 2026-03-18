@@ -7,18 +7,16 @@ insights for specific sectors in India.
 import time
 import uuid
 import logging
-import hashlib
-import hmac
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
-from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Depends, Request, Header
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, field_validator
+
+import os
 
 # ─────────────────────────────────────────
 # Logging
@@ -30,44 +28,39 @@ logging.basicConfig(
 logger = logging.getLogger("trade_api")
 
 # ─────────────────────────────────────────
-# Config (swap in real keys via env vars)
+# Config
 # ─────────────────────────────────────────
-import os
-
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
-GEMINI_MODEL:   str = "gemini-2.0-flash-001"
-GEMINI_URL:     str = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-2.0-flash-001:generateContent?key={GEMINI_API_KEY}"
-)
+
+def get_gemini_url() -> str:
+    return (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.0-flash-001:generateContent?key={GEMINI_API_KEY}"
+    )
 
 # Simple pre-shared API keys for demo auth
-# In production these would live in a secrets manager
 VALID_API_KEYS: dict[str, str] = {
     "demo-key-001": "demo_user_1",
     "demo-key-002": "demo_user_2",
     "guest-key-000": "guest",
 }
 
-# Rate-limit: max requests per window
+# Rate-limit settings
 RATE_LIMIT_REQUESTS: int = 5
 RATE_LIMIT_WINDOW_SECONDS: int = 60
+
+# Cache TTL
+CACHE_TTL_SECONDS: int = 600
 
 # ─────────────────────────────────────────
 # In-memory stores
 # ─────────────────────────────────────────
-# { user_id: [(timestamp, …), …] }
 rate_limit_store: dict[str, list[float]] = defaultdict(list)
-
-# { session_id: {created, user_id, requests: int} }
 session_store: dict[str, dict] = {}
-
-# { sector: {timestamp, report} }  – simple cache (TTL: 10 min)
 report_cache: dict[str, dict] = {}
-CACHE_TTL_SECONDS: int = 600
 
 # ─────────────────────────────────────────
-# Valid sectors (input validation)
+# Valid sectors
 # ─────────────────────────────────────────
 VALID_SECTORS: set[str] = {
     "pharmaceuticals", "technology", "agriculture", "textiles",
@@ -108,7 +101,7 @@ def get_current_user(
     token = credentials.credentials
     user_id = VALID_API_KEYS.get(token)
     if not user_id:
-        logger.warning("Unauthorised access attempt with token: %s…", token[:8])
+        logger.warning("Unauthorised access attempt with token: %s", token[:8])
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
     return user_id
 
@@ -120,7 +113,6 @@ def check_rate_limit(user_id: str = Depends(get_current_user)) -> str:
     now = time.time()
     window_start = now - RATE_LIMIT_WINDOW_SECONDS
 
-    # Purge old entries
     rate_limit_store[user_id] = [
         t for t in rate_limit_store[user_id] if t > window_start
     ]
@@ -164,69 +156,28 @@ def get_or_create_session(request: Request, user_id: str) -> str:
 
 
 # ─────────────────────────────────────────
-# DuckDuckGo search (no API key needed)
-# ─────────────────────────────────────────
-async def search_web(query: str, max_results: int = 8) -> list[dict]:
-    """Fetch DuckDuckGo Instant Answer + text snippets."""
-    results: list[dict] = []
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                "https://api.duckduckgo.com/",
-                params={
-                    "q": query,
-                    "format": "json",
-                    "no_html": "1",
-                    "skip_disambig": "1",
-                },
-                headers={"User-Agent": "TradeOpportunitiesAPI/1.0"},
-            )
-            data = resp.json()
-
-        abstract = data.get("AbstractText", "")
-        if abstract:
-            results.append({"title": data.get("Heading", query), "snippet": abstract})
-
-        for topic in data.get("RelatedTopics", [])[:max_results]:
-            text = topic.get("Text", "")
-            if text:
-                results.append({"title": topic.get("FirstURL", ""), "snippet": text})
-
-    except Exception as exc:
-        logger.error("Web search error: %s", exc)
-
-    return results
-
-
-# ─────────────────────────────────────────
 # Gemini analysis
 # ─────────────────────────────────────────
-async def analyse_with_gemini(sector: str, search_results: list[dict]) -> str:
-    """Send collected snippets to Gemini and get a markdown report."""
-    snippets = "\n".join(
-        f"- {r['snippet']}" for r in search_results if r.get("snippet")
-    ) or "No live data available; use general knowledge."
+async def analyse_with_gemini(sector: str) -> str:
+    """Send prompt to Gemini and get a markdown report."""
 
     prompt = f"""You are a senior trade analyst specialising in Indian markets.
 
 Sector under analysis: **{sector.upper()}**
 Today's date: {datetime.utcnow().strftime('%B %d, %Y')}
 
-Web data collected:
-{snippets}
-
 Produce a **structured Markdown trade-opportunity report** with exactly these sections:
 
-# Trade Opportunity Report – {sector.title()} Sector (India)
+# Trade Opportunity Report - {sector.title()} Sector (India)
 
 ## 1. Executive Summary
-(3–4 sentences covering the most important insight)
+(3-4 sentences covering the most important insight)
 
 ## 2. Sector Overview
 (Current state, key players, market size)
 
 ## 3. Current Market Trends
-(Bullet list of 5–7 recent trends)
+(Bullet list of 5-7 recent trends)
 
 ## 4. Trade Opportunities
 (Table with columns: Opportunity | Target Markets | Estimated Value | Confidence)
@@ -261,9 +212,10 @@ Use clear, concise, professional language. Be specific to India.
     }
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        gemini_url = get_gemini_url()
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
-                GEMINI_URL,
+                gemini_url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
             )
@@ -276,9 +228,7 @@ Use clear, concise, professional language. Be specific to India.
             )
 
         data = resp.json()
-        return (
-            data["candidates"][0]["content"]["parts"][0]["text"]
-        )
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
     except HTTPException:
         raise
@@ -312,14 +262,14 @@ async def analyze_sector(
     Returns a structured Markdown report with current trade opportunities
     for the requested sector in India.
 
-    **Auth**: Pass your API key as a Bearer token in the `Authorization` header.
+    **Auth**: Pass your API key as a Bearer token in the Authorization header.
 
     **Available sectors**: pharmaceuticals, technology, agriculture, textiles,
     automobiles, energy, finance, healthcare, manufacturing, chemicals, metals,
     real_estate, fmcg, infrastructure, it_services, telecom, retail, defence,
     aviation, gems_jewellery
     """
-    # ── Input validation ──────────────────
+    # Input validation
     sector_clean = sector.lower().strip().replace(" ", "_").replace("-", "_")
     if sector_clean not in VALID_SECTORS:
         raise HTTPException(
@@ -330,19 +280,18 @@ async def analyze_sector(
             ),
         )
 
-    # ── Session tracking ──────────────────
+    # Session tracking
     session_id = get_or_create_session(request, user_id)
     logger.info("Request | user=%s | session=%s | sector=%s", user_id, session_id, sector_clean)
 
-    # ── Cache check ───────────────────────
+    # Cache check
     now = time.time()
     if sector_clean in report_cache:
         entry = report_cache[sector_clean]
         if now - entry["timestamp"] < CACHE_TTL_SECONDS:
             logger.info("Cache hit for sector: %s", sector_clean)
-            cached_report = entry["report"]
             return PlainTextResponse(
-                content=cached_report,
+                content=entry["report"],
                 headers={
                     "X-Session-ID": session_id,
                     "X-Cache": "HIT",
@@ -350,24 +299,10 @@ async def analyze_sector(
                 },
             )
 
-    # ── Data collection ───────────────────
-    search_queries = [
-        f"India {sector_clean} sector trade opportunities 2024 2025",
-        f"India {sector_clean} exports imports market analysis",
-        f"India {sector_clean} industry growth trends recent news",
-    ]
+    # LLM analysis
+    report = await analyse_with_gemini(sector_clean)
 
-    all_results: list[dict] = []
-    for query in search_queries:
-        results = await search_web(query)
-        all_results.extend(results)
-
-    logger.info("Collected %d snippets for sector: %s", len(all_results), sector_clean)
-
-    # ── LLM analysis ─────────────────────
-    report = await analyse_with_gemini(sector_clean, all_results)
-
-    # ── Cache store ───────────────────────
+    # Cache store
     report_cache[sector_clean] = {"timestamp": now, "report": report}
 
     return PlainTextResponse(

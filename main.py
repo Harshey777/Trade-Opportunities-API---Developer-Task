@@ -35,10 +35,10 @@ logger = logging.getLogger("trade_api")
 import os
 
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
-GEMINI_MODEL:   str = "gemini-1.5-flash-8b"
+GEMINI_MODEL:   str = "gemini-2.0-flash-001"
 GEMINI_URL:     str = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-1.5-flash-8b:generateContent?key={GEMINI_API_KEY}"
+    f"gemini-2.0-flash-001:generateContent?key={GEMINI_API_KEY}"
 )
 
 # Simple pre-shared API keys for demo auth
